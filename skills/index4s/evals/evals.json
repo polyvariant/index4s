@@ -1,0 +1,55 @@
+{
+  "skill_name": "index4s",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I'm starting a new Scala 3 project and need to pick a JSON library. Which one should I use? I care about it being actively maintained. Add your recommendation to my build.sbt — the file is at the repo root.",
+      "expected_output": "Agent runs `index4s search json --rank` (not thin search, not web search) to compare stars/freshness, notes circe (or equivalent top fresh candidate) with a recent release vs stale alternatives like json4s, then runs `index4s get circe/circe` to fetch resolved coordinates and appends the exact sbt snippet line from the card output (double %% form) to build.sbt rather than writing coordinates from memory.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "my build keeps failing on this dep, sbt says not found: com.disneystreaming:weaver-cats_3. But I'm pretty sure weaver works on scala native, I've seen people use it. Fix my build.sbt (repo root) — I need weaver-cats for Scala Native 0.5 testing.",
+      "expected_output": "Agent recognizes the moved-namespace pattern instead of declaring weaver unavailable: treats the user's claim as primary source. Note the trap: `index4s get com.disneystreaming:weaver-cats_3` exits 0 against the STALE ghost (0.8.4, native0.4 only) — the agent must catch the did-you-mean stderr line or the ghost card's 'THIS PROJECT HAS BEEN MOVED' readme rather than trusting the exit-0 card, or go directly to `index4s get typelevel/weaver-test`. It then discovers the canonical org.typelevel namespace with the native0.5 line (0.13.x), checks platform support on the card's latest line, and writes the corrected org.typelevel coordinates (with weaver testFramework registration if thorough) into build.sbt.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "what's the signature of cats.Monad.flatten? also what other type classes does cats-core export next to Monad?",
+      "expected_output": "Agent delegates BOTH parts to cellar, not index4s: resolves the cats-core coordinate first via `index4s get typelevel/cats` (never from memory), then runs `cellar get-external org.typelevel:cats-core_3:<version> cats.Monad` for the signature and `cellar list-external org.typelevel:cats-core_3:<version> cats` for siblings. index4s is used (if at all) only for coordinate resolution, never for symbol lookup.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "script me a quick check: for each of circe, play-json, json4s and tethys print stars and latest version, then tell me which ones are still actively released",
+      "expected_output": "Agent uses the machine-readable surface for scripting: `index4s search json --rank --json | jq` over results, and/or `index4s get <name> stars` / `get <name> latest` field paths per project — one command per fact instead of scraping markdown cards. Correctly reads tier (active/sleepy/dead) or releaseDate to answer the freshness question; notes json4s is stale/dead vs the others active.",
+      "files": []
+    }
+  ],
+  "trigger_evals": [
+    {
+      "query": "scala 3 project here, need to parse some json in my http service. which library do people actually use these days? circe still the go-to or is there something fresher",
+      "should_trigger": true
+    },
+    {
+      "query": "can you add fs2 to my build.sbt? latest version please, and it needs to work with scala native 0.5",
+      "should_trigger": true
+    },
+    {
+      "query": "sbt keeps 404ing on org.scalatest:scalatest_3 for me, that can't be right, scalatest definitely exists. what are the right coordinates",
+      "should_trigger": true
+    },
+    {
+      "query": "show me the signature of cats.Monad and list everything in the cats.syntax package",
+      "should_trigger": false
+    },
+    {
+      "query": "add this to my pom.xml: com.fasterxml.jackson.core:jackson-databind:2.17.0 — java project, no scala anywhere",
+      "should_trigger": false
+    },
+    {
+      "query": "what does fs2's Stream.compile do? explain like I'm migrating from iterators",
+      "should_trigger": false
+    }
+  ]
+}

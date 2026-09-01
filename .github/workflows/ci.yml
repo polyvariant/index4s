@@ -1,0 +1,130 @@
+# CI — compile + scalafmt check + full native test suite (weaver, running
+# natively) on every push/PR, across the same 4-platform matrix that
+# release.yml ships binaries for. Fail-fast is off so a broken platform is
+# visible without hiding the others.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  S2N_VERSION: v1.7.8
+  SBT_VERSION: 2.0.8
+
+jobs:
+  test:
+    name: test ${{ matrix.osname }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors release.yml's build matrix (minus the retired/Windows cases).
+        include:
+          - os: ubuntu-latest
+            osname: linux
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            osname: linux
+            arch: arm64
+          - os: macos-latest
+            osname: macos
+            arch: arm64
+          - os: macos-15-intel
+            osname: macos
+            arch: x86_64
+    steps:
+      # fetch-depth 0: sbt-dynver derives the version from git tags; without
+      # history every build degrades to the 0.0.0 fallback.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # `runner` is unavailable in job-level env — export for later steps (sbt boots capture env).
+      - name: Set s2n install locations
+        run: |
+          echo "S2N_PREFIX=$RUNNER_TEMP/s2n-install" >> "$GITHUB_ENV"
+          echo "S2N_LIBDIR=$RUNNER_TEMP/s2n-install/lib" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: sbt
+
+      # sbt via the official distro (shell script + launcher jar): works on
+      # every arch in this matrix (coursier has no linux-aarch64 prebuilt).
+      - name: Install sbt
+        run: |
+          set -euo pipefail
+          curl -sfL "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/sbt/bin" >> "$GITHUB_PATH"
+
+      - name: Cache s2n-tls (static)
+        id: s2n-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/s2n-install
+          key: s2n-static-${{ env.S2N_VERSION }}-${{ matrix.osname }}-${{ matrix.arch }}
+
+      # Always run, even on s2n cache hits: the link needs clang, -lcrypto
+      # (libssl-dev) and -lidn2 (libidn2-dev — the runtime lib alone is in
+      # the base image, so discovery adds -lidn2 even without the package).
+      - name: Dependencies (linux)
+        if: matrix.osname == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends libssl-dev libidn2-dev clang cmake
+
+      # Same provisioning as release.yml so test links see the exact env the
+      # release links do: INDEX4S_LIBCRYPTO_A force-loads a STATIC libcrypto.
+      - name: Dependencies (macos)
+        if: matrix.osname == 'macos'
+        run: |
+          set -euo pipefail
+          brew install cmake openssl@3
+          echo "INDEX4S_LIBCRYPTO_A=$(brew --prefix openssl@3)/lib/libcrypto.a" >> "$GITHUB_ENV"
+          test -f "$(brew --prefix openssl@3)/lib/libcrypto.a"
+
+      - name: Provision s2n-tls (static)
+        if: steps.s2n-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [[ "${{ matrix.osname }}" == "macos" ]]; then
+            # openssl@3 is keg-only; point s2n's find_package(crypto) at it.
+            EXTRA_ARGS=("-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)")
+          fi
+          git clone --depth 1 --branch "$S2N_VERSION" https://github.com/aws/s2n-tls.git "$RUNNER_TEMP/s2n-src"
+          cmake -S "$RUNNER_TEMP/s2n-src" -B "$RUNNER_TEMP/s2n-build" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$S2N_PREFIX" \
+            "${EXTRA_ARGS[@]}"
+          cmake --build "$RUNNER_TEMP/s2n-build" --parallel --target install
+          test -f "$S2N_LIBDIR/libs2n.a"
+
+      # Platform-independent — once per run is enough (fastest runner).
+      - name: Scalafmt check
+        if: matrix.osname == 'linux' && matrix.arch == 'amd64'
+        run: sbt --batch "scalafmtCheckAll ; scalafmtSbtCheck ; shutdown"
+
+      - name: Compile
+        run: sbt --batch "Compile / compile ; Test / compile ; shutdown"
+
+      - name: Test (weaver, native)
+        run: sbt --batch "testFull ; shutdown"

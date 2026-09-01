@@ -1,0 +1,383 @@
+# Release pipeline — builds static s2n-tls on every runner, links index4s in
+# release-fast mode, packages tar.gz (+.sha256) AND the raw native binary,
+# smoke-tests the packaged binary against live Scaladex, and (on v* tags)
+# publishes a GitHub release plus the Maven Central artifacts.
+#
+# TLS policy: every runner provisions s2n-tls at a pinned tag and links it
+# STATICALLY via S2N_LIBDIR. The sbt 2 server captures environment variables
+# at startup, so the S2N install locations are exported via GITHUB_ENV before
+# any sbt invocation. There is NO fallback HTTP transport: ember+s2n is the
+# only client. If a platform cannot link s2n, that platform's release is
+# blocked until provisioning is fixed — never worked around.
+#
+# Distribution (coursier contrib): coursier resolves the version from the
+# Maven artifact (version anchor only, never executed) and downloads the RAW
+# `index4s-<version>-<osname>-<arch>` asset — its name is referenced verbatim
+# by coursier/apps and must not be renamed.
+#
+# Triggers: PRs and main pushes build + smoke + upload artifacts (no
+# release); workflow_dispatch is a full dry-run; v* tags additionally create
+# the GitHub release and publish to Maven Central (publishSigned stages into
+# sbt 2's localStaging bundle, sonaRelease uploads + releases it via the
+# Central Portal using SONATYPE_USERNAME/SONATYPE_PASSWORD).
+#
+# Windows x64 is DISABLED: no s2n-tls provisioning path exists there yet
+# (analysis and intended first attempt in the commented-out job at the
+# bottom of this file).
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  S2N_VERSION: v1.7.8
+  SBT_VERSION: 2.0.8
+
+jobs:
+  build:
+    name: index4s ${{ matrix.osname }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One broken platform must not cancel the others: blocked platforms are
+      # visible as failures, working platforms still produce assets.
+      fail-fast: false
+      matrix:
+        # macos-13 is retired upstream; macos-15-intel is the current x64
+        # macOS image. Windows x64: see the disabled job at the bottom.
+        include:
+          - os: ubuntu-latest
+            osname: linux
+            arch: amd64
+            ext: tar.gz
+          - os: ubuntu-24.04-arm
+            osname: linux
+            arch: arm64
+            ext: tar.gz
+          - os: macos-latest
+            osname: macos
+            arch: arm64
+            ext: tar.gz
+          - os: macos-15-intel
+            osname: macos
+            arch: x86_64
+            ext: tar.gz
+    steps:
+      # fetch-depth 0: dynver needs the tag, or the version silently degrades to 0.0.0.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # `runner` is unavailable in job-level env — export for later steps (sbt boots capture env).
+      - name: Set s2n install locations
+        run: |
+          echo "S2N_PREFIX=$RUNNER_TEMP/s2n-install" >> "$GITHUB_ENV"
+          echo "S2N_LIBDIR=$RUNNER_TEMP/s2n-install/lib" >> "$GITHUB_ENV"
+
+      - name: Set up Java 21 (temurin)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: sbt
+
+      # sbt via the official distro (shell script + launcher jar): works on
+      # every arch in this matrix (coursier has no linux-aarch64 prebuilt).
+      # The launcher reads project/build.properties and resolves sbt 2.0.8.
+      - name: Install sbt
+        run: |
+          set -euo pipefail
+          curl -sfL "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/sbt/bin" >> "$GITHUB_PATH"
+
+      - name: Cache s2n-tls (static)
+        id: s2n-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/s2n-install
+          key: s2n-static-${{ env.S2N_VERSION }}-${{ matrix.osname }}-${{ matrix.arch }}
+
+      # Always run, even on s2n cache hits: the link needs clang, -lcrypto
+      # (libssl-dev) and -lidn2 (libidn2-dev — the runtime lib alone is in
+      # the base image, so discovery adds -lidn2 even without the package).
+      - name: Dependencies (linux)
+        if: matrix.osname == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends libssl-dev libidn2-dev clang cmake
+
+      # Always run, even on s2n cache hits: exports INDEX4S_LIBCRYPTO_A, which
+      # build.sbt needs at sbt boot to -force_load a STATIC libcrypto into the
+      # binary (a dynamic brew libcrypto would bake its absolute keg path into
+      # the binary and break on stock macOS).
+      - name: Dependencies (macos)
+        if: matrix.osname == 'macos'
+        run: |
+          set -euo pipefail
+          brew install cmake openssl@3
+          echo "INDEX4S_LIBCRYPTO_A=$(brew --prefix openssl@3)/lib/libcrypto.a" >> "$GITHUB_ENV"
+          test -f "$(brew --prefix openssl@3)/lib/libcrypto.a"
+
+      - name: Provision s2n-tls (static)
+        if: steps.s2n-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [[ "${{ matrix.osname }}" == "macos" ]]; then
+            # openssl@3 is keg-only; point s2n's find_package(crypto) at it.
+            EXTRA_ARGS=("-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)")
+          fi
+          git clone --depth 1 --branch "$S2N_VERSION" https://github.com/aws/s2n-tls.git "$RUNNER_TEMP/s2n-src"
+          cmake -S "$RUNNER_TEMP/s2n-src" -B "$RUNNER_TEMP/s2n-build" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$S2N_PREFIX" \
+            "${EXTRA_ARGS[@]}"
+          cmake --build "$RUNNER_TEMP/s2n-build" --parallel --target install
+          test -f "$S2N_LIBDIR/libs2n.a"
+          ls -la "$S2N_LIBDIR"
+
+      # S2N_LIBDIR (exported to GITHUB_ENV above) must be live at sbt boot.
+      # Release-fast via the plugin's built-in task: dev/test links stay debug;
+      # only release artifacts pay for -O.
+      - name: Link (release-fast)
+        run: sbt --batch "nativeLinkReleaseFast ; shutdown"
+
+      - name: Package
+        env:
+          OSNAME: ${{ matrix.osname }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          # Strip the v prefix (tags) and replace slashes (PR refs are `N/merge`,
+          # branch names may contain them) so asset filenames stay flat.
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//\//-}"
+          STEM="index4s-${VERSION}-${OSNAME}-${ARCH}"
+          ASSET="${STEM}.tar.gz"
+          BIN="$(find target/out -type f -name index4s-release-fast | head -n 1)"
+          test -n "$BIN"
+          mkdir -p staging dist
+          cp "$BIN" staging/index4s
+          chmod +x staging/index4s
+          # Raw binary: this is what coursier's prebuiltBinaries serves for
+          # `cs install --contrib index4s` (name referenced by coursier/apps).
+          cp staging/index4s "dist/$STEM"
+          tar -czf "dist/$ASSET" -C staging index4s
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+          else
+            (cd dist && shasum -a 256 "$ASSET" > "$ASSET.sha256")
+          fi
+          cat "dist/$ASSET.sha256"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          echo "ASSET_STEM=$STEM" >> "$GITHUB_ENV"
+
+      # The real per-asset gate: run the freshly packaged binary (extracted
+      # from the exact archive we ship) against live Scaladex.
+      - name: Smoke test (packaged binary, live Scaladex)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/smoke"
+          tar -xzf "dist/$ASSET" -C "$RUNNER_TEMP/smoke"
+          BIN="$RUNNER_TEMP/smoke/index4s"
+          V="$("$BIN" --version)"
+          echo "--version: $V"
+          case "$V" in
+            index4s\ *) ;;
+            *) echo "::error::unexpected --version output: $V"; exit 1 ;;
+          esac
+          if ! STARS="$("$BIN" get circe/circe stars)"; then
+            echo "::error::get circe/circe stars failed"
+            exit 1
+          fi
+          echo "get circe/circe stars: $STARS"
+          echo "$STARS" | grep -Eq '^[0-9]+$' \
+            || { echo "::error::expected numeric stars output, got: $STARS"; exit 1; }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ASSET_STEM }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all assets
+        uses: actions/download-artifact@v8
+        with:
+          path: assets
+          pattern: index4s-*
+          merge-multiple: true
+
+      - name: Verify asset set
+        run: |
+          set -euo pipefail
+          ls -la assets/
+          # 4 platforms x (raw binary + archive + .sha256) = 12 files.
+          # Windows disabled — when it ships, expect 15.
+          test "$(find assets -type f | wc -l)" -ge 12
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: assets/*
+          generate_release_notes: true
+
+  # Maven Central: the org.polyvariant:index4s_native0.5_3 artifact is the
+  # version anchor coursier resolves `latest.stable` against. publishSigned
+  # needs no s2n/clang — publishing packages scalac output only, no linking.
+  # Needs full git history: dynver derives the published version from tags.
+  publish:
+    name: Maven Central publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history — sbt-dynver derives the version from tags)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21 (temurin)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: sbt
+
+      - name: Install sbt
+        run: |
+          set -euo pipefail
+          curl -sfL "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/sbt/bin" >> "$GITHUB_PATH"
+
+      # sbt 2 maps SONATYPE_USERNAME/SONATYPE_PASSWORD to a
+      # central.sonatype.com credential out of the box; sonaRelease uploads
+      # the localStaging bundle and releases it in one go.
+      - name: Import signing key
+        env:
+          PGP_SECRET: ${{ secrets.PGP_SECRET }}
+          PGP_PASSPHRASE: ${{ secrets.PGP_PASSPHRASE }}
+        run: ./.github/workflows/import-gpg.sh
+
+      - name: Publish (publishSigned + sonaRelease)
+        env:
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+        run: sbt --batch "publishSigned ; sonaRelease ; shutdown"
+
+# ---------------------------------------------------------------------------
+# DISABLED: windows x64. Releases stay blocked until s2n-tls can be
+# provisioned on Windows — there is no HTTP transport fallback to ship
+# instead. This block documents the known blockers and an intended first
+# attempt; unblock by moving the job back into `jobs:` (uncommented) and
+# iterating on the flagged steps.
+#
+# Known blockers (from reading s2n-tls v1.7.8's own CI; not yet executed):
+#   1. s2n-tls upstream CI (ci_windows.yml @ v1.7.8) builds Windows via MSYS2
+#      (ucrt64/mingw64/clang64: mingw-w64-*-clang + cmake + ninja) against
+#      AWS-LC — there is NO MSVC/vcpkg path upstream anymore.
+#   2. Scala Native on Windows targets MSVC (docs: Visual Studio "Desktop
+#      development with C++" + separate LLVM; "C++ Clang tools for Windows
+#      does not work"). Its linker flags are MSVC dialect.
+#   3. build.sbt's s2n link flags are GNU-ld dialect (-Wl,--no-as-needed …);
+#   4. MinGW libs2n.a (winpthreads, mingw CRT) linked into an MSVC-ABI Scala
+#      Native binary is an untested ABI mix with no known precedent.
+#
+# Intended first attempt (expected to fail at Link; kept for iteration):
+#
+#  build-windows:
+#    name: index4s windows-x64
+#    runs-on: windows-latest
+#    timeout-minutes: 60
+#    env:
+#      # NOTE: `runner` is not available in job-level env — export
+#      # S2N_PREFIX/S2N_LIBDIR via GITHUB_ENV in an early step, like the
+#      # unix jobs above.
+#    steps:
+#      - uses: actions/checkout@v7
+#      - uses: actions/setup-java@v6
+#        with:
+#          distribution: temurin
+#          java-version: "21"
+#          cache: sbt
+#      - name: Install sbt
+#        shell: pwsh
+#        run: |
+#          $ErrorActionPreference = "Stop"
+#          $zip = "$env:RUNNER_TEMP\sbt.zip"
+#          Invoke-WebRequest "https://github.com/sbt/sbt/releases/download/v2.0.8/sbt-2.0.8.zip" -OutFile $zip
+#          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+#          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\sbt\bin"
+#      - name: Provision s2n-tls (static, MSYS2/clang64 per upstream CI)
+#        shell: msys2 {0}
+#        run: |
+#          set -eu
+#          # msys2/setup-msys2 action would precede this step with:
+#          #   msystem: clang64, install: mingw-w64-clang-x86_64-clang cmake ninja git
+#          git clone --depth 1 --branch v1.7.8 https://github.com/aws/s2n-tls.git "$RUNNER_TEMP/s2n-src"
+#          cmake -S "$RUNNER_TEMP/s2n-src" -B "$RUNNER_TEMP/s2n-build" \
+#            -G Ninja -DCMAKE_C_COMPILER=clang \
+#            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+#            -DCMAKE_BUILD_TYPE=Release \
+#            -DCMAKE_INSTALL_PREFIX="$S2N_PREFIX"
+#          cmake --build "$RUNNER_TEMP/s2n-build" --parallel --target install
+#          test -f "$S2N_LIBDIR/libs2n.a"
+#      - name: Link (release-fast)   # EXPECTED TO FAIL: MSVC vs MinGW ABI mix
+#        shell: pwsh
+#        run: sbt --batch "nativeLinkReleaseFast ; shutdown"
+#      - name: Package
+#        shell: pwsh
+#        run: |
+#          $ErrorActionPreference = "Stop"
+#          $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+#          $asset = "index4s-$version-windows-x64.zip"
+#          $bin = Get-ChildItem -Recurse -Filter index4s-release-fast.exe target\out | Select-Object -First 1
+#          New-Item -ItemType Directory -Force dist, staging | Out-Null
+#          Copy-Item $bin.FullName staging\index4s.exe
+#          Compress-Archive -Path staging\index4s.exe -DestinationPath "dist\$asset"
+#          (Get-FileHash -Algorithm SHA256 "dist\$asset").Hash.ToLower() + "  $asset" | Out-File "dist\$asset.sha256" -NoNewline
+#          "ASSET=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+#          "ASSET_STEM=index4s-$version-windows-x64" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+#      - name: Smoke test (packaged binary, live Scaladex)
+#        shell: pwsh
+#        run: |
+#          $ErrorActionPreference = "Stop"
+#          Expand-Archive "dist\$env:ASSET" -DestinationPath "$env:RUNNER_TEMP\smoke"
+#          $bin = "$env:RUNNER_TEMP\smoke\index4s.exe"
+#          $v = & $bin --version
+#          if ($v -notlike "index4s *") { throw "unexpected --version: $v" }
+#          $stars = & $bin get circe/circe stars
+#          if ($stars -notmatch '^\d+$') { throw "expected numeric stars, got: $stars" }
+#      - uses: actions/upload-artifact@v7
+#        with:
+#          name: ${{ env.ASSET_STEM }}
+#          path: dist\
+#          if-no-files-found: error
+# ---------------------------------------------------------------------------
