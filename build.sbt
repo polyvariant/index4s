@@ -28,32 +28,12 @@ lazy val index4s = project
     // (resolves to 0.5.12 — same winner as under sbt 1; Scala Native test-interface is
     // backward-compatible across 0.5.x, this silences the false-positive strict conflict)
     libraryDependencySchemes += "org.scala-native" % "test-interface_native0.5_3" % VersionScheme.Always,
-    // ember's native TLS: link with S2N_LIBDIR=<s2n-tls-prefix>/lib (holds libs2n.a).
-    // Scala Native's discovery reads the env var and adds -ls2n, but NOT the
-    // -L search path — supply it via nativeConfig (sbt 2 plugin has no bare
-    // nativeLinkingOptions key). Only libs2n.a exists there, so s2n is linked
-    // STATICALLY; its undefined OpenSSL symbols are resolved by -lcrypto
-    // (DYNAMIC on Linux, from system OpenSSL — libcrypto.so.3 becomes a
-    // runtime dep).
-    // Scala Native places custom linkingOptions BEFORE its discovered -l
-    // flags and prepends -Wl,--as-needed, so a bare -lcrypto here would be
-    // dropped (nothing references it yet) before -ls2n pulls OpenSSL refs —
-    // wrap it in --no-as-needed to keep it live for the whole link.
-    // Platform gating (flags differ by linker):
-    //   Linux (GNU ld)      -L + --no-as-needed/-lcrypto/--as-needed, as above.
-    //   macOS (ld64)        --no-as-needed/--as-needed DO NOT EXIST on ld64.
-    //                        Release CI sets INDEX4S_LIBCRYPTO_A to brew
-    //                        openssl@3's libcrypto.a, which is -force_load-ed:
-    //                        position-independent (our flags precede -ls2n, so
-    //                        a plain archive listed earlier would contribute
-    //                        nothing) and makes the binary self-contained
-    //                        (dynamic brew libcrypto would bake its absolute
-    //                        path into the binary and break on stock macOS).
-    //                        Without the env var: plain -lcrypto (dev fallback).
-    //   Windows             Nil — windows releases are disabled until an
-    //                        s2n-tls provisioning path exists (see
-    //                        .github/workflows/release.yml). GNU-style -Wl
-    //                        flags are rejected by MSVC link anyway.
+    // ember's native TLS: link with S2N_LIBDIR=<s2n-tls-prefix>/lib — libs2n.a
+    // is built with a STATIC libcrypto interned in (-DS2N_INTERN_LIBCRYPTO=ON,
+    // s2n$-prefixed symbols). Linux flags additionally force-include STATIC
+    // idn2/z so the binary's only dynamic deps are glibc. WHY: option
+    // ordering, the macOS -force_load branch, Windows blockers, provisioning
+    // and verification recipes → docs/linking.md.
     // NOTE: the sbt 2 server captures env at startup — REBOOT the server
     // (shutdown + fresh invocation) after changing S2N_LIBDIR.
     nativeConfig := nativeConfig.value.withLinkingOptions(
@@ -69,7 +49,18 @@ lazy val index4s = project
               case None          => Seq(s"-L$dir", "-lcrypto")
             }
           else
-            Seq(s"-L$dir", "-Wl,--no-as-needed", "-lcrypto", "-Wl,--as-needed")
+            Seq(
+              s"-L$dir",
+              "-Wl,--whole-archive",
+              "-l:libidn2.a",
+              "-l:libz.a",
+              "-Wl,--no-whole-archive",
+              // SELECTIVE (outside the whole-archive group): Ubuntu's libidn2.a
+              // bundles only ~12 unistring objects; its remaining uc_* refs are
+              // completed from here. Already-defined bundled symbols prevent
+              // extraction of the duplicate members — see docs/linking.md.
+              "-l:libunistring.a"
+            )
         sys.env.get("S2N_LIBDIR").map(s2nFlags).getOrElse(Seq.empty)
       }
     ),

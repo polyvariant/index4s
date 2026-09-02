@@ -77,17 +77,20 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/s2n-install
-          key: s2n-static-${{ env.S2N_VERSION }}-${{ matrix.osname }}-${{ matrix.arch }}
+          # 'interned' marks the S2N_INTERN_LIBCRYPTO build — bump to force
+          # re-provisioning whenever the cmake flags change again.
+          key: s2n-static-interned-${{ env.S2N_VERSION }}-${{ matrix.osname }}-${{ matrix.arch }}
 
-      # Always run, even on s2n cache hits: the link needs clang, -lcrypto
-      # (libssl-dev) and -lidn2 (libidn2-dev — the runtime lib alone is in
-      # the base image, so discovery adds -lidn2 even without the package).
+      # Always run, even on s2n cache hits: the link needs clang and the
+      # STATIC archives — libcrypto.a is interned into libs2n.a by s2n's own
+      # cmake step (libssl-dev), and libidn2.a/libz.a + the selective
+      # libunistring.a are force-included by build.sbt (docs/linking.md).
       - name: Dependencies (linux)
         if: matrix.osname == 'linux'
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends libssl-dev libidn2-dev clang cmake
+          sudo apt-get install -y --no-install-recommends libssl-dev libidn2-dev libunistring-dev zlib1g-dev clang cmake
 
       # Same provisioning as release.yml so test links see the exact env the
       # release links do: INDEX4S_LIBCRYPTO_A force-loads a STATIC libcrypto.
@@ -107,6 +110,11 @@ jobs:
           if [[ "${{ matrix.osname }}" == "macos" ]]; then
             # openssl@3 is keg-only; point s2n's find_package(crypto) at it.
             EXTRA_ARGS=("-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)")
+          else
+            # Linux: intern the STATIC libcrypto into libs2n.a (self-contained
+            # binary — no libcrypto.so.3 runtime dep). Not macOS-viable:
+            # interning needs GNU objcopy. See docs/linking.md.
+            EXTRA_ARGS=("-DS2N_INTERN_LIBCRYPTO=ON")
           fi
           git clone --depth 1 --branch "$S2N_VERSION" https://github.com/aws/s2n-tls.git "$RUNNER_TEMP/s2n-src"
           cmake -S "$RUNNER_TEMP/s2n-src" -B "$RUNNER_TEMP/s2n-build" \
@@ -127,4 +135,21 @@ jobs:
         run: sbt --batch "Compile / compile ; Test / compile ; shutdown"
 
       - name: Test (weaver, native)
-        run: sbt --batch "testFull ; shutdown"
+        run: sbt --batch "testFull ; nativeLink ; shutdown"
+
+      # Self-containment gate (docs/linking.md): dynamic deps must be glibc
+      # only, interned s2n$ libcrypto must be present, glibc floor pinned.
+      - name: Verify link (linux)
+        if: matrix.osname == 'linux'
+        run: |
+          set -euo pipefail
+          BIN="$(find target/out -type f -name index4s | head -n 1)"
+          test -n "$BIN" && test -x "$BIN"
+          echo "NEEDED:"; readelf -d "$BIN" | grep NEEDED
+          EXTRA="$(readelf -d "$BIN" | awk '/NEEDED/ {print $NF}' | tr -d '[]' | grep -vE '^(libm\.|libc\.|ld-linux)' || true)"
+          test -z "$EXTRA" || { echo "::error::unexpected dynamic deps: $EXTRA"; exit 1; }
+          test "$(nm "$BIN" | grep -c 's2n\$')" -gt 0
+          FLOOR="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "glibc floor: $FLOOR"
+          test "$FLOOR" = "GLIBC_2.38" \
+            || { echo "::error::glibc floor moved: $FLOOR — update docs/linking.md consciously"; exit 1; }

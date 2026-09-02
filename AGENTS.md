@@ -13,15 +13,16 @@ Scala Native CLI for Scaladex-backed Scala library discovery + docs, shipped wit
 - Do not modify `scaladex/` — reference checkout of scalacenter/scaladex (gitignored).
 
 ## Build & verify (sbt 2.0.8)
+- **`docs/linking.md` — canonical reference for the native link** (s2n interning, static idn2/z/unistring, glibc floor, verification recipe). Read it before touching linking options, s2n provisioning, or CI link steps.
 - sbt 2: quote compound commands; sbt is client-by-default; **never `sbtn`**.
 - `test` is incremental/cached — real execution is **`testFull`**:
   ```bash
-  export S2N_LIBDIR=/home/majk/Code/personal/s2n-tls/s2n-tls-install/lib
+  export S2N_LIBDIR=/home/majk/Code/personal/index4s/.native-deps/s2n-install/lib
   sbt --batch "testFull ; shutdown"
   ```
 - **Env vars are captured when the sbt server boots.** After changing S2N_LIBDIR (or any env), kill the server (`; shutdown` or `pkill -f sbt-launch`) and start fresh — otherwise linking fails with `cannot find -ls2n`.
-- `nativeLink` → `target/out/native0.5/scala-3.3.8/index4s/index4s` (plus `index4s-release-fast`). The binary runs WITHOUT env vars: s2n is statically linked; only runtime dep is system libcrypto.so.3.
-- The s2n `-L` + `-lcrypto` (wrapped in `--no-as-needed`) live in build.sbt's env-guarded `nativeConfig` block. Scala Native's discovery reads S2N_LIBDIR for its own compile but does NOT add `-L` to the final app link — that's what the block is for.
+- `nativeLink` → `target/out/native0.5/scala-3.3.8/index4s/index4s` (plus `index4s-release-fast`). The binary runs WITHOUT env vars: s2n (with interned static libcrypto) and idn2/z/unistring are all statically linked; the only dynamic deps are glibc (floor 2.38).
+- The s2n `-L` + static-archive flags (`--whole-archive -l:libidn2.a -l:libz.a --no-whole-archive` + selective `-l:libunistring.a`; NO `-lcrypto` — interning resolved it) live in build.sbt's env-guarded `nativeConfig` block. Scala Native's discovery reads S2N_LIBDIR for its own compile but does NOT add `-L` to the final app link — that's what the block is for. Local s2n provisioning lives in gitignored `.native-deps/` (built from the pinned v1.7.8 tag).
 
 ## Dependencies — verify coordinates, don't trust memory/docs
 - weaver = **`org.typelevel` 0.13.0** (`_native0.5_3` published; the old `com.disneystreaming` groupId has NO native0.5 — this stale groupId caused a wrong "no native support" conclusion once).

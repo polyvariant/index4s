@@ -9,7 +9,7 @@ Provides two tools:
 
 All data comes from the Scaladex public API - no scores or opinions beyond the documented star/date sorts. Useful precisely when memory is stale: namespaces move (weaver moved `com.disneystreaming` → `org.typelevel`) and memory-resolved coordinates 404.
 
-Static-ish binary (Scala Native), one runtime dependency on Linux (`libcrypto.so.3`), fully self-contained on macOS.
+Statically linked binary (Scala Native). On Linux the only dynamic dependency is glibc ≥ 2.38 (Ubuntu 24.04+, Debian 13+, Fedora 39+, RHEL 10, Arch, NixOS — not RHEL 9-era or Alpine); fully self-contained on macOS. Details: [docs/linking.md](docs/linking.md).
 
 ## Install
 
@@ -132,16 +132,17 @@ $ index4s get circe/circe --json | jq -r '.default | "\(.groupId):\(.artifactId)
 
 Scala 3.3.8 · Scala Native 0.5.12 · sbt 2.0.8 (sbt must be started with `S2N_LIBDIR` set - the server captures env at boot) · cats-effect / fs2 / sttp+ember / upickle / decline · weaver tests, running natively.
 
-TLS: HTTP goes through http4s-ember-client with AWS **s2n-tls** linked statically. There is no alternative transport. You provision s2n-tls once:
+TLS: HTTP goes through http4s-ember-client with AWS **s2n-tls** linked statically, with a static libcrypto interned into it plus statically linked idn2/zlib/libunistring — the binary's only dynamic dependency on Linux is glibc. There is no alternative transport. Full linking story (platform matrix, glibc floor, verification recipe): [docs/linking.md](docs/linking.md). You provision s2n-tls once (Linux; on macOS drop `-DS2N_INTERN_LIBCRYPTO=ON` — interning needs GNU objcopy):
 
 ```console
 $ git clone --depth 1 --branch v1.7.8 https://github.com/aws/s2n-tls.git /tmp/s2n-tls
 $ cmake -S /tmp/s2n-tls -B /tmp/s2n-tls/build -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+    -DUNSAFE_TREAT_WARNINGS_AS_ERRORS=OFF -DS2N_INTERN_LIBCRYPTO=ON \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/s2n-install"
 $ cmake --build /tmp/s2n-tls/build --parallel --target install
 ```
 
-(needs OpenSSL headers: `sudo apt install libssl-dev clang cmake` on Ubuntu, `brew install openssl@3` on macOS)
+(needs the static archives: `sudo apt install libssl-dev libidn2-dev libunistring-dev zlib1g-dev clang cmake` on Ubuntu, `brew install openssl@3` on macOS. This repo's dev box keeps its provisioning in gitignored `.native-deps/`.)
 
 Then, in a **fresh** shell:
 
